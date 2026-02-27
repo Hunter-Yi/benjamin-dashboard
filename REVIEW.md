@@ -140,3 +140,143 @@ _save_agent_events(events)
 - **무한 증가 문제:** agent-events.json은 POST 엔드포인트 경로에서는 500건 cap이 있으나, **kanban 자동스폰 경로에서 cap 미적용** — 무한 증가 가능 확인됨 (H1)
 - **즉시 조치 필요:** H1(events cap), H4(token 환경변수)는 1-2줄 수정으로 즉시 적용 가능
 - **전반적 평가:** 기능적으로 잘 동작하는 대시보드이나, 외부 접근이 가능한 환경에서 인증 부재와 토큰 노출이 가장 큰 보안 위험
+
+---
+---
+
+# 2차 코드 리뷰 (2026-02-27) — WS broadcast, log parsing, agent status live update
+
+**리뷰어:** Reviewer Agent
+**날짜:** 2026-02-27
+**커밋:** `2c98237` (fix: WS URL prefix + log parsing + agent status live update via WS broadcast)
+**대상 파일:**
+- `backend/main.py` — ConnectionManager, WS broadcast, log parsing, agent status
+- `frontend/src/components/RealtimePanel.jsx` — WS URL fix
+- `frontend/src/components/AgentStatus.jsx` — WS listener
+
+---
+
+## 1차 리뷰 이슈 해결 현황
+
+| 이슈 | 상태 | 확인 내용 |
+|------|------|----------|
+| **H1** agent-events 500건 cap | **해결** | `put_kanban` 경로에 `if len(events) > 500: events = events[-500:]` 추가 (line 546-547) |
+| **H2** 파일 경쟁 조건 | **해결** | `_file_lock` (asyncio.Lock)이 kanban 자동스폰 (line 537)과 kanban 저장 (line 559) 경로 모두 적용 |
+| **H3** API 인증 부재 | **미해결** | 여전히 전체 엔드포인트 인증 없음 |
+| **H4** Bot token 하드코딩 | **해결** | `os.environ.get()` 사용으로 전환 (line 39-40) |
+| **M3** AgentStatus 자동 갱신 없음 | **해결** | `setInterval(fetchAgents, 30000)` 추가 (AgentStatus.jsx:57) + WS 이벤트 연동 (line 61-79) |
+| **M4** WS 자동 재연결 없음 | **해결** | RealtimePanel.jsx에 exponential backoff 재연결 구현 (line 62-66, 2s→30s max) |
+| **M6** subprocess 실패 무시 | **해결** | `logger.warning()` 로깅 추가 (line 533-534) |
+| **M1** KanbanUpdate 검증 | **미해결** | 여전히 `dict` 타입 |
+| **M2** AgentEventCreate 길이 제한 | **미해결** | 여전히 제한 없음 |
+| **M5** 프론트엔드 에러 무시 | **미해결** | AgentStatus.jsx:51 여전히 `.catch(() => {})` |
+| **M7** 토큰 추정치 부정확 | **미해결** | 동일 로직 유지 |
+| **L1** globmod 미사용 | **미해결** | line 8에 여전히 존재 |
+| **L2** AGENT_COLORS 중복 | **미해결** | 동일 |
+| **L3** Loading 중복 | **미해결** | 동일 |
+| **L4** 카드 ID 충돌 | **미해결** | 동일 |
+| **L5** ESC 핸들러 closure | **미해결** | 동일 |
+
+**요약: 16건 중 7건 해결 (H1, H2, H4, M3, M4, M6 + 신규 ConnectionManager/broadcast 기능)**
+
+---
+
+## 이번 수정에서 발견된 신규 이슈
+
+### HIGH — 즉시 수정 필요
+
+#### H5. ws_logs 초기 로드 시 전체 파일을 메모리에 적재
+- **위치:** `backend/main.py:645`
+- **설명:** `log_path.read_text()` 로 오늘의 로그 파일 전체를 메모리에 읽은 뒤 `.split("\n")[-50:]` 으로 마지막 50줄만 사용. OpenClaw가 활발히 동작하면 하루 로그가 수십 MB에 달할 수 있으며, **WS 연결마다** 전체 파일을 메모리에 로드.
+- **영향:** 동시 WS 클라이언트 N개 × 로그파일 크기만큼 메모리 소비. OOM 가능.
+- **수정안:**
+```python
+# deque를 이용한 tail 방식
+from collections import deque
+with open(log_path, "r", errors="replace") as f:
+    last_lines = deque(f, maxlen=50)
+for line in last_lines:
+    parsed = _parse_log_line(line)
+    if parsed:
+        await websocket.send_json(parsed)
+```
+
+---
+
+### MEDIUM — 개선 권장
+
+#### M8. 동일 페이지에서 WebSocket 이중 연결
+- **위치:** `AgentStatus.jsx:64`, `RealtimePanel.jsx:54`
+- **설명:** AgentStatus와 RealtimePanel이 각각 독립적으로 `/ws/logs` WebSocket 연결을 생성. 같은 페이지에서 두 탭이 모두 렌더링되면 **동일 클라이언트가 2개의 WS 연결**을 유지. 서버 ConnectionManager에 중복 등록.
+- **수정:** 앱 레벨에서 단일 WS 연결을 공유하는 context/hook 도입. 예: `useWebSocket()` custom hook.
+
+#### M9. _detect_spawn_in_logs() 매 API 호출마다 전체 로그 스캔
+- **위치:** `backend/main.py:165-207`, `get_agents()` line 248에서 호출
+- **설명:** `/api/agents` 호출 시 매번 오늘의 전체 로그 파일을 줄 단위로 스캔. 30초 polling × 클라이언트 수만큼 반복. 로그 파일이 커질수록 응답 지연.
+- **수정:** 결과를 메모리에 캐시하고 TTL(예: 30초) 적용, 또는 마지막 스캔 위치를 기록하여 incremental scan.
+
+#### M10. spawn_event가 개별 클라이언트에만 전송 (broadcast 미사용)
+- **위치:** `backend/main.py:671`
+- **설명:** `ws_logs`에서 감지한 `spawn_event`를 `await websocket.send_json(spawn_event)` 로 해당 WS 연결에만 전송. `agent_event` (line 477)는 `manager.broadcast()`로 전체 전송하는 것과 불일치. 다른 클라이언트가 spawn 이벤트를 못 받음.
+- **수정:** `await manager.broadcast(spawn_event)` 사용, 또는 spawn 감지를 별도 백그라운드 태스크로 분리.
+
+---
+
+### LOW — 코드 품질
+
+#### L6. AgentStatus WS 재연결 backoff 미적용
+- **위치:** `AgentStatus.jsx:75`
+- **설명:** `setTimeout(connect, 3000)` 으로 고정 3초 재연결. RealtimePanel은 exponential backoff(2s→30s) 사용. 동일 패턴 적용 권장.
+
+#### L7. ws_logs 일반 예외 핸들러에 로깅 없음
+- **위치:** `backend/main.py:675-676`
+- **설명:** `except Exception: manager.disconnect(websocket)` — WS 연결이 비정상 종료될 때 에러 원인이 기록되지 않아 디버깅 어려움.
+- **수정:** `except Exception as e: logger.error(f"ws_logs error: {e}"); manager.disconnect(websocket)`
+
+#### L8. ConnectionManager.active 리스트 무한 증가 가능성
+- **위치:** `backend/main.py:57-71`
+- **설명:** WS 연결이 정상 close 없이 끊어지면 (네트워크 단절 등) `disconnect()`가 호출되지 않을 수 있음. `broadcast()` 시 실패한 연결은 제거되지만, broadcast가 호출되지 않는 기간에는 stale 연결이 쌓임.
+- **수정:** 주기적 heartbeat/ping 또는 최대 연결 수 제한 고려.
+
+---
+
+## 코드 품질 총평 (이번 수정)
+
+### 잘된 점
+1. **ConnectionManager 패턴** — broadcast 시 `list(self.active)` 복사 후 순회하여 iteration 중 mutation 방지. 전송 실패 시 자동 제거. 깔끔한 구현.
+2. **WS URL 구성 수정** — `import.meta.env.BASE_URL` 활용하여 reverse proxy (Tailscale funnel `/benjamin` prefix) 환경에서 정상 동작하도록 수정. 정확한 접근.
+3. **agent_event broadcast → AgentStatus 실시간 갱신** — POST /api/agent-events 시 WS broadcast → AgentStatus가 감지하여 자동 re-fetch. 의도대로 동작하며 사용자 경험 대폭 개선.
+4. **Exponential backoff 재연결** — RealtimePanel에서 2s~30s backoff. 네트워크 불안정 시 서버 부하 방지.
+5. **1차 리뷰 HIGH 이슈 대부분 해결** — H1, H2, H4 해결으로 데이터 안정성과 보안 개선.
+
+### 주의 필요
+1. **메모리 효율** — H5 (전체 로그 파일 메모리 로드)가 가장 시급. 운영 환경에서 문제 발생 가능.
+2. **중복 WS 연결** — M8. 클라이언트당 2개 연결은 리소스 낭비.
+3. **API 인증** — H3 여전히 미해결. 외부 접근 가능 환경에서 가장 큰 리스크.
+
+---
+
+## 추가 개선 제안 (업데이트)
+
+| 우선순위 | 제안 | 상태 |
+|---------|------|------|
+| **P0** | agent-events cap 통일 (H1) | **해결** |
+| **P0** | Bot token 환경변수 (H4) | **해결** |
+| **P0** | ws_logs 메모리 최적화 (H5) | **신규 — 즉시 수정 필요** |
+| **P1** | API 인증 추가 (H3) | 미해결 |
+| **P1** | WS 단일 연결 공유 (M8) | 신규 |
+| **P1** | 로그 스캔 캐시 (M9) | 신규 |
+| **P2** | spawn broadcast 수정 (M10) | 신규 |
+| **P2** | 에러 UI 표시 (M5) | 미해결 |
+| **P3** | AgentStatus backoff (L6) | 신규 |
+| **P3** | ws_logs 예외 로깅 (L7) | 신규 |
+
+---
+
+## 전체 요약
+
+- **1차 리뷰 대비:** 16건 중 7건 해결. 특히 HIGH 이슈 3/4 해결 (H1, H2, H4).
+- **이번 수정 신규:** 7건 추가 (HIGH 1, MEDIUM 3, LOW 3)
+- **미해결 총계:** HIGH 2건 (H3 인증, H5 메모리), MEDIUM 6건, LOW 8건
+- **가장 시급:** H5 (ws_logs 메모리), H3 (API 인증)
+- **전반 평가:** WS broadcast와 실시간 업데이트 구현이 잘 되었으나, 메모리 효율과 인증이 운영 안정성의 핵심 과제로 남아 있음
