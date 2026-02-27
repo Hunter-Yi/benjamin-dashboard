@@ -17,6 +17,8 @@ const AGENT_ROLES = {
   optimizer: "최적화 에이전트",
 };
 
+const EVENT_ICONS = { start: "🔧", checkpoint: "📍", complete: "✅", error: "❌" };
+
 function timeAgo(iso) {
   if (!iso) return "—";
   const diff = (Date.now() - new Date(iso).getTime()) / 1000;
@@ -26,17 +28,56 @@ function timeAgo(iso) {
   return `${Math.floor(diff / 86400)}일 전`;
 }
 
+function formatTime(iso) {
+  if (!iso) return "";
+  try {
+    return new Date(iso).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return iso;
+  }
+}
+
 export default function AgentStatus() {
   const [agents, setAgents] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [selectedAgent, setSelectedAgent] = useState(null);
+  const [events, setEvents] = useState([]);
+  const [eventsLoading, setEventsLoading] = useState(false);
 
-  useEffect(() => {
-    fetch("/api/agents")
+  const fetchAgents = () => {
+    fetch(`${import.meta.env.BASE_URL}api/agents`)
       .then((r) => r.json())
       .then(setAgents)
       .catch(() => {})
       .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    fetchAgents();
+    const interval = setInterval(fetchAgents, 30000);
+    return () => clearInterval(interval);
   }, []);
+
+  const openModal = (agent) => {
+    setSelectedAgent(agent);
+    setEventsLoading(true);
+    fetch(`${import.meta.env.BASE_URL}api/agent-events?agent=${agent.id}&limit=20`)
+      .then((r) => r.json())
+      .then((data) => setEvents(data))
+      .catch(() => setEvents([]))
+      .finally(() => setEventsLoading(false));
+  };
+
+  const closeModal = () => {
+    setSelectedAgent(null);
+    setEvents([]);
+  };
+
+  useEffect(() => {
+    const handleEsc = (e) => { if (e.key === "Escape") closeModal(); };
+    if (selectedAgent) window.addEventListener("keydown", handleEsc);
+    return () => window.removeEventListener("keydown", handleEsc);
+  }, [selectedAgent]);
 
   if (loading) return <Loading />;
 
@@ -49,7 +90,8 @@ export default function AgentStatus() {
           return (
             <div
               key={agent.id}
-              className={`rounded-xl border ${st.bg} bg-zinc-900/60 p-4 hover:bg-zinc-800/60 transition-colors`}
+              onClick={() => openModal(agent)}
+              className={`rounded-xl border ${st.bg} bg-zinc-900/60 p-4 hover:bg-zinc-800/60 transition-colors cursor-pointer`}
             >
               <div className="flex items-start justify-between mb-3">
                 <div className="flex items-center gap-2">
@@ -84,6 +126,82 @@ export default function AgentStatus() {
           );
         })}
       </div>
+
+      {/* Agent Detail Modal */}
+      {selectedAgent && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={closeModal}>
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
+          <div
+            className="relative bg-zinc-900 border border-zinc-700 rounded-2xl w-full max-w-lg max-h-[80vh] overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between p-5 border-b border-zinc-800">
+              <div className="flex items-center gap-3">
+                <span className="text-2xl">{AGENT_ICONS[selectedAgent.id]}</span>
+                <div>
+                  <div className="font-semibold text-zinc-100">{selectedAgent.id}</div>
+                  <div className="text-xs text-zinc-500">{AGENT_ROLES[selectedAgent.id]}</div>
+                </div>
+              </div>
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-1.5">
+                  <div className={`w-2.5 h-2.5 rounded-full ${(STATUS_STYLES[selectedAgent.status] || STATUS_STYLES.offline).dot}`} />
+                  <span className="text-sm text-zinc-400">{(STATUS_STYLES[selectedAgent.status] || STATUS_STYLES.offline).label}</span>
+                </div>
+                <button onClick={closeModal} className="text-zinc-500 hover:text-zinc-300 text-lg">&times;</button>
+              </div>
+            </div>
+
+            {/* Info */}
+            <div className="p-5 space-y-2 text-sm border-b border-zinc-800">
+              <div className="flex justify-between">
+                <span className="text-zinc-500">마지막 활동</span>
+                <span className="text-zinc-300">{timeAgo(selectedAgent.lastActivity)}</span>
+              </div>
+              {selectedAgent.currentTask && (
+                <div className="flex justify-between">
+                  <span className="text-zinc-500">현재 작업</span>
+                  <span className="text-zinc-300">{selectedAgent.currentTask}</span>
+                </div>
+              )}
+              {selectedAgent.workspace && (
+                <div className="flex justify-between">
+                  <span className="text-zinc-500">워크스페이스</span>
+                  <span className="text-zinc-300 text-xs font-mono">{selectedAgent.workspace}</span>
+                </div>
+              )}
+            </div>
+
+            {/* Event Timeline */}
+            <div className="p-5 overflow-y-auto" style={{ maxHeight: "40vh" }}>
+              <h4 className="text-sm font-semibold text-zinc-400 mb-3">최근 이벤트</h4>
+              {eventsLoading ? (
+                <div className="flex justify-center py-6">
+                  <div className="animate-spin w-5 h-5 border-2 border-violet-500 border-t-transparent rounded-full" />
+                </div>
+              ) : events.length === 0 ? (
+                <div className="text-center text-zinc-600 text-sm py-6">이벤트 없음</div>
+              ) : (
+                <div className="space-y-2">
+                  {[...events].reverse().map((evt) => (
+                    <div key={evt.id} className="flex items-start gap-3 py-2 border-b border-zinc-800/50 last:border-0">
+                      <span className="text-base mt-0.5">{EVENT_ICONS[evt.event] || "📋"}</span>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm text-zinc-200">{evt.message}</div>
+                        <div className="text-xs text-zinc-500 mt-0.5">{formatTime(evt.timestamp)} · {evt.event}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Color bar */}
+            <div className="h-1" style={{ backgroundColor: selectedAgent.color }} />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

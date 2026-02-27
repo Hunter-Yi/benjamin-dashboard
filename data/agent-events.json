@@ -1,0 +1,30 @@
+[
+  {
+    "id": "594e14b9-e2fa-4f0f-9466-5e1060d35573",
+    "agent": "builder",
+    "event": "start",
+    "message": "테스트 이벤트",
+    "timestamp": "2026-02-27T15:13:52.469342"
+  },
+  {
+    "id": "19dc2e4d-b3b2-40d6-802f-9ac0a1aa2737",
+    "agent": "builder",
+    "event": "start",
+    "message": "test from tester agent",
+    "timestamp": "2026-02-27T15:18:35.111560"
+  },
+  {
+    "id": "06de35b3-55b5-496c-9b88-073636831494",
+    "agent": "tester",
+    "event": "start",
+    "message": "칸반 자동 스폰: Auto-move test card",
+    "timestamp": "2026-02-27T15:18:55.045073"
+  },
+  {
+    "id": "8fa53184-2cde-42e1-a030-02987e52bfc2",
+    "agent": "tester",
+    "event": "checkpoint",
+    "message": "Test event for H1/H2 verification",
+    "timestamp": "2026-02-27T15:28:49.722933"
+  }
+]

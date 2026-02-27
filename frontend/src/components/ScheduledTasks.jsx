@@ -18,8 +18,8 @@ export default function ScheduledTasks() {
 
   useEffect(() => {
     Promise.all([
-      fetch("/api/crons").then((r) => r.json()),
-      fetch("/api/memory/summary").then((r) => r.json()),
+      fetch(`${import.meta.env.BASE_URL}api/crons`).then((r) => r.json()),
+      fetch(`${import.meta.env.BASE_URL}api/memory/summary`).then((r) => r.json()),
     ])
       .then(([c, m]) => { setCrons(c); setMemory(m); })
       .catch(() => {})

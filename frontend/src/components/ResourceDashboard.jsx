@@ -14,7 +14,7 @@ export default function ResourceDashboard() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch("/api/resources")
+    fetch(`${import.meta.env.BASE_URL}api/resources`)
       .then((r) => r.json())
       .then(setData)
       .catch(() => {})

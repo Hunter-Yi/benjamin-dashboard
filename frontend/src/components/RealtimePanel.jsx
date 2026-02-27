@@ -42,24 +42,44 @@ function LogStreaming() {
   const [autoScroll, setAutoScroll] = useState(true);
   const containerRef = useRef(null);
   const wsRef = useRef(null);
+  const retryDelayRef = useRef(2000);
 
   useEffect(() => {
-    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${proto}//${window.location.host}/ws/logs`;
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    let unmounted = false;
 
-    ws.onopen = () => setConnected(true);
-    ws.onclose = () => setConnected(false);
-    ws.onerror = () => setConnected(false);
-    ws.onmessage = (evt) => {
-      try {
-        const data = JSON.parse(evt.data);
-        setLogs((prev) => [...prev.slice(-500), data]);
-      } catch {}
+    function connectWS() {
+      if (unmounted) return;
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${proto}//${window.location.host}/ws/logs`;
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        setConnected(true);
+        retryDelayRef.current = 2000;
+      };
+      ws.onclose = () => {
+        setConnected(false);
+        if (!unmounted) {
+          setTimeout(() => connectWS(), retryDelayRef.current);
+          retryDelayRef.current = Math.min(retryDelayRef.current * 2, 30000);
+        }
+      };
+      ws.onerror = () => setConnected(false);
+      ws.onmessage = (evt) => {
+        try {
+          const data = JSON.parse(evt.data);
+          setLogs((prev) => [...prev.slice(-500), data]);
+        } catch {}
+      };
+    }
+
+    connectWS();
+
+    return () => {
+      unmounted = true;
+      if (wsRef.current) wsRef.current.close();
     };
-
-    return () => { ws.close(); };
   }, []);
 
   useEffect(() => {
@@ -110,7 +130,7 @@ function TelegramFeed() {
   const [error, setError] = useState(null);
 
   const fetchMessages = useCallback(() => {
-    fetch("/api/telegram/feed")
+    fetch(`${import.meta.env.BASE_URL}api/telegram/feed`)
       .then((r) => r.json())
       .then((data) => {
         if (data.error) setError(data.error);

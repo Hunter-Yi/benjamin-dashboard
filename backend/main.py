@@ -3,19 +3,26 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import glob as globmod
+import subprocess
+import uuid
 from datetime import datetime, date
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from dotenv import load_dotenv
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
-from typing import Any
 
 import httpx
+
+load_dotenv(Path(__file__).parent.parent / ".env")
+
+logger = logging.getLogger(__name__)
 
 # ── Paths ──────────────────────────────────────────────────────────────
 OPENCLAW_DIR = Path.home() / ".openclaw"
@@ -26,10 +33,11 @@ SESSIONS_FILE = OPENCLAW_DIR / "agents" / "main" / "sessions" / "sessions.json"
 LOG_DIR = Path("/tmp/openclaw")
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 KANBAN_FILE = DATA_DIR / "kanban.json"
+AGENT_EVENTS_FILE = DATA_DIR / "agent-events.json"
 DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
-TELEGRAM_BOT_TOKEN = "8520380418:AAHpCcJnPqlMY7obnTMkkAJ-nzKh_bmLpyM"
-TELEGRAM_GROUP_ID = "-1003889486980"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_GROUP_ID = os.environ.get("TELEGRAM_GROUP_ID", "")
 
 AGENT_IDS = ["main", "researcher", "builder", "tester", "integrator", "reviewer", "optimizer"]
 AGENT_COLORS = {
@@ -47,6 +55,8 @@ INPUT_COST_PER_M = 3.0
 OUTPUT_COST_PER_M = 15.0
 
 app = FastAPI(title="Benjamin Command Center")
+
+_file_lock = asyncio.Lock()
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -81,6 +91,104 @@ def _get_agent_sessions() -> dict:
     return data
 
 
+def _get_per_agent_session_info(agent_id: str) -> dict:
+    """Check per-agent session directory for activity timestamps."""
+    agent_sessions_dir = OPENCLAW_DIR / "agents" / agent_id / "sessions"
+    info: dict = {"last_modified": 0, "session_count": 0, "active_sessions": []}
+
+    if not agent_sessions_dir.exists():
+        return info
+
+    # Check for sessions.json in agent-specific dir
+    agent_sessions_file = agent_sessions_dir / "sessions.json"
+    if agent_sessions_file.exists():
+        agent_data = _load_json(agent_sessions_file)
+        if agent_data:
+            for key, session in agent_data.items():
+                updated = session.get("updatedAt", 0)
+                if updated > info["last_modified"]:
+                    info["last_modified"] = updated
+                info["active_sessions"].append(key)
+
+    # Also check .jsonl session files (active, not deleted/reset)
+    for f in agent_sessions_dir.glob("*.jsonl"):
+        if ".deleted." in f.name or ".reset." in f.name:
+            continue
+        info["session_count"] += 1
+        try:
+            mtime_ms = int(f.stat().st_mtime * 1000)
+            if mtime_ms > info["last_modified"]:
+                info["last_modified"] = mtime_ms
+        except Exception:
+            pass
+
+    return info
+
+
+def _find_agent_in_session_keys(sessions: dict) -> dict:
+    """Parse session keys to find activity for each agent."""
+    agent_activity: dict = {}
+    for key, session in sessions.items():
+        # Keys like "agent:researcher:main", "agent:builder:main"
+        parts = key.split(":")
+        if len(parts) >= 2 and parts[0] == "agent":
+            aid = parts[1]
+            updated = session.get("updatedAt", 0)
+            if aid not in agent_activity or updated > agent_activity[aid]["updatedAt"]:
+                agent_activity[aid] = {
+                    "updatedAt": updated,
+                    "sessionKey": key,
+                    "origin": session.get("origin", {}),
+                    "sessionId": session.get("sessionId", ""),
+                }
+    return agent_activity
+
+
+def _detect_spawn_in_logs() -> dict:
+    """Scan today's log for coding-agent spawns and agent activations."""
+    spawn_times: dict = {}
+    log_path = _today_log_path()
+    if not log_path.exists():
+        return spawn_times
+
+    try:
+        agent_names_lower = {a.lower(): a for a in AGENT_IDS}
+        with open(log_path, "r", errors="replace") as f:
+            for line in f:
+                line_lower = line.lower()
+                # Detect coding-agent skill invocations (spawn events)
+                if "coding-agent" in line_lower or "coding_agent" in line_lower:
+                    try:
+                        obj = json.loads(line)
+                        ts = obj.get("time", "")
+                        if ts:
+                            # Check if any agent name is referenced
+                            for name_lower, name in agent_names_lower.items():
+                                if name_lower in line_lower and name != "main":
+                                    spawn_times[name] = ts
+                            # If no specific agent found, record as generic spawn
+                            if not any(n in spawn_times for n in AGENT_IDS[1:]):
+                                spawn_times.setdefault("_last_spawn", ts)
+                    except Exception:
+                        pass
+                # Detect "lane task done" for specific agents
+                elif "lane task done" in line_lower:
+                    try:
+                        obj = json.loads(line)
+                        msg = obj.get("1", "")
+                        ts = obj.get("time", "")
+                        if ts and isinstance(msg, str):
+                            for name_lower, name in agent_names_lower.items():
+                                if name_lower in msg.lower():
+                                    spawn_times[name] = ts
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return spawn_times
+
+
 def _estimate_tokens_from_sessions() -> dict:
     """Estimate token usage per agent from session file sizes."""
     sessions_dir = OPENCLAW_DIR / "agents" / "main" / "sessions"
@@ -113,16 +221,36 @@ async def get_agents():
     config = _load_json(OPENCLAW_CONFIG) or {}
     agents_list = config.get("agents", {}).get("list", [])
     sessions = _get_agent_sessions()
+    all_events = _load_agent_events()
+
+    # Parse all session keys for per-agent activity
+    agent_activity = _find_agent_in_session_keys(sessions)
+
+    # Detect spawn events from logs
+    spawn_times = _detect_spawn_in_logs()
 
     result = []
     for agent_cfg in agents_list:
         aid = agent_cfg["id"]
 
-        # Find matching session
+        # 1) Check parsed session keys (e.g. "agent:researcher:main")
+        activity = agent_activity.get(aid, {})
+        updated_at = activity.get("updatedAt", 0)
+        origin = activity.get("origin", {})
+
+        # 2) Also check per-agent session directory
+        per_agent = _get_per_agent_session_info(aid)
+        if per_agent["last_modified"] > updated_at:
+            updated_at = per_agent["last_modified"]
+
+        # 3) Fallback: direct session key lookup
         session_key = f"agent:{aid}:main"
         session = sessions.get(session_key, {})
+        session_updated = session.get("updatedAt", 0)
+        if session_updated > updated_at:
+            updated_at = session_updated
+            origin = session.get("origin", {})
 
-        updated_at = session.get("updatedAt", 0)
         last_activity = ""
         status = "offline"
         if updated_at:
@@ -134,13 +262,38 @@ async def get_agents():
             elif diff_minutes < 60:
                 status = "idle"
 
+        # 4) Determine last_spawned from log detection
+        last_spawned = spawn_times.get(aid, "")
+
+        # 5) Recent events from agent-events.json
+        agent_events = [e for e in all_events if e.get("agent") == aid]
+        recent_events = agent_events[-5:]
+        # Update last_activity from events if more recent
+        if agent_events:
+            event_ts = agent_events[-1].get("timestamp", "")
+            if event_ts and (not last_activity or event_ts > last_activity):
+                last_activity = event_ts
+                # Re-evaluate status based on event timestamp
+                try:
+                    evt_dt = datetime.fromisoformat(event_ts)
+                    diff_minutes = (datetime.now() - evt_dt).total_seconds() / 60
+                    if diff_minutes < 5:
+                        status = "active"
+                    elif diff_minutes < 60 and status == "offline":
+                        status = "idle"
+                except Exception:
+                    pass
+
         result.append({
             "id": aid,
             "status": status,
             "color": AGENT_COLORS.get(aid, "#6b7280"),
             "lastActivity": last_activity,
-            "currentTask": session.get("origin", {}).get("label", ""),
+            "lastSpawned": last_spawned,
+            "currentTask": origin.get("label", "") or session.get("origin", {}).get("label", ""),
             "workspace": agent_cfg.get("workspace", ""),
+            "sessionCount": per_agent["session_count"],
+            "recentEvents": recent_events,
         })
     return result
 
@@ -263,6 +416,55 @@ async def get_memory_summary():
     }
 
 
+# ── Agent Events helpers ───────────────────────────────────────────────
+def _load_agent_events() -> list:
+    data = _load_json(AGENT_EVENTS_FILE)
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def _save_agent_events(events: list):
+    AGENT_EVENTS_FILE.write_text(json.dumps(events, ensure_ascii=False, indent=2))
+
+
+# ── API: Agent Events ─────────────────────────────────────────────────
+class AgentEventCreate(BaseModel):
+    agent: str
+    event: str  # start | checkpoint | complete | error
+    message: str
+
+
+@app.post("/api/agent-events")
+async def post_agent_event(payload: AgentEventCreate):
+    async with _file_lock:
+        events = _load_agent_events()
+        entry = {
+            "id": str(uuid.uuid4()),
+            "agent": payload.agent,
+            "event": payload.event,
+            "message": payload.message,
+            "timestamp": datetime.now().isoformat(),
+        }
+        events.append(entry)
+        # Keep max 500 events
+        if len(events) > 500:
+            events = events[-500:]
+        _save_agent_events(events)
+    return entry
+
+
+@app.get("/api/agent-events")
+async def get_agent_events(
+    agent: Optional[str] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+):
+    events = _load_agent_events()
+    if agent:
+        events = [e for e in events if e.get("agent") == agent]
+    return events[-limit:]
+
+
 # ── API: Kanban ────────────────────────────────────────────────────────
 @app.get("/api/kanban")
 async def get_kanban():
@@ -280,8 +482,59 @@ class KanbanUpdate(BaseModel):
 
 @app.put("/api/kanban")
 async def put_kanban(payload: KanbanUpdate):
-    KANBAN_FILE.write_text(json.dumps(payload.model_dump(), ensure_ascii=False, indent=2))
-    return {"ok": True}
+    data = payload.model_dump()
+
+    # Detect cards in "queued" column → auto-spawn + move to "in_progress"
+    queued_col = data.get("columns", {}).get("queued")
+    in_progress_col = data.get("columns", {}).get("doing")
+    spawned_ids = []
+    if queued_col and in_progress_col and queued_col.get("cardIds"):
+        for card_id in list(queued_col["cardIds"]):
+            card = data["cards"].get(card_id)
+            if not card:
+                continue
+            agent = card.get("agent", "builder")
+            title = card.get("title", "")
+            description = card.get("description", "")
+            workdir = card.get("workdir", "")
+
+            # Fire openclaw system event
+            event_text = f"Kanban 작업대기: {title} | agent={agent} | workdir={workdir} | desc={description}"
+            try:
+                subprocess.Popen(
+                    ["openclaw", "system", "event", "--text", event_text, "--mode", "now"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                logger.warning(f"Failed to spawn via openclaw: {e}")
+
+            # Record agent event
+            async with _file_lock:
+                events = _load_agent_events()
+                events.append({
+                    "id": str(uuid.uuid4()),
+                    "agent": agent,
+                    "event": "start",
+                    "message": f"칸반 자동 스폰: {title}",
+                    "timestamp": datetime.now().isoformat(),
+                })
+                if len(events) > 500:
+                    events = events[-500:]
+                _save_agent_events(events)
+
+            # Set started_at and move to in_progress
+            card["started_at"] = datetime.now().isoformat()
+            spawned_ids.append(card_id)
+
+        # Move spawned cards from queued to in_progress
+        for cid in spawned_ids:
+            queued_col["cardIds"].remove(cid)
+            in_progress_col["cardIds"].append(cid)
+
+    async with _file_lock:
+        KANBAN_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    return {"ok": True, "spawned": spawned_ids if queued_col and in_progress_col else []}
 
 
 # ── API: Telegram Feed ─────────────────────────────────────────────────
@@ -316,6 +569,44 @@ async def get_telegram_feed():
 
 
 # ── WebSocket: Log Streaming ──────────────────────────────────────────
+_SPAWN_KEYWORDS = ["coding-agent", "coding_agent", "spawn", "sub-agent", "delegat"]
+_AGENT_NAMES_LOWER = {a.lower(): a for a in AGENT_IDS}
+
+
+def _detect_spawn_event(line: str) -> dict | None:
+    """Check if a log line indicates an agent spawn or activation."""
+    line_lower = line.lower()
+    for kw in _SPAWN_KEYWORDS:
+        if kw in line_lower:
+            # Try to identify which agent
+            for name_lower, name in _AGENT_NAMES_LOWER.items():
+                if name_lower in line_lower and name != "main":
+                    try:
+                        obj = json.loads(line)
+                        ts = obj.get("time", "")
+                    except Exception:
+                        ts = datetime.now().isoformat()
+                    return {
+                        "type": "agent_spawn",
+                        "agent": name,
+                        "timestamp": ts,
+                        "message": f"Agent '{name}' spawn detected",
+                    }
+            # Generic spawn event
+            try:
+                obj = json.loads(line)
+                ts = obj.get("time", "")
+            except Exception:
+                ts = datetime.now().isoformat()
+            return {
+                "type": "agent_spawn",
+                "agent": "unknown",
+                "timestamp": ts,
+                "message": "Agent spawn activity detected",
+            }
+    return None
+
+
 @app.websocket("/ws/logs")
 async def ws_logs(websocket: WebSocket):
     await websocket.accept()
@@ -349,6 +640,11 @@ async def ws_logs(websocket: WebSocket):
                         parsed = _parse_log_line(line)
                         if parsed:
                             await websocket.send_json(parsed)
+
+                        # Detect and broadcast agent spawn events
+                        spawn_event = _detect_spawn_event(line)
+                        if spawn_event:
+                            await websocket.send_json(spawn_event)
                 last_size = current_size
     except WebSocketDisconnect:
         pass
