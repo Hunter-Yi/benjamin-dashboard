@@ -280,3 +280,123 @@ for line in last_lines:
 - **미해결 총계:** HIGH 2건 (H3 인증, H5 메모리), MEDIUM 6건, LOW 8건
 - **가장 시급:** H5 (ws_logs 메모리), H3 (API 인증)
 - **전반 평가:** WS broadcast와 실시간 업데이트 구현이 잘 되었으나, 메모리 효율과 인증이 운영 안정성의 핵심 과제로 남아 있음
+
+---
+---
+
+# 4차 코드 리뷰 (2026-02-27) — H1 cap, H3 인증, H5 ws 메모리, M1/M2 검증, M5 에러처리, M8 WS 이중연결, sessions_spawn 감지
+
+**리뷰어:** Reviewer Agent
+**날짜:** 2026-02-27
+**대상 파일:**
+- `backend/main.py` — APIKeyMiddleware, KanbanUpdate validator, AgentEventCreate max_length, ws_logs 메모리, sessions_spawn 감지
+- `frontend/src/components/AgentStatus.jsx` — fetchAgents 에러 처리
+- `frontend/src/components/RealtimePanel.jsx` — WS 연결 상태
+
+---
+
+## 3차 리뷰 이슈 해결 현황
+
+| 이슈 | 상태 | 확인 내용 |
+|------|------|----------|
+| **H3** API 인증 부재 | **부분 해결** | `APIKeyMiddleware` 추가됨. 단, `API_KEY` 미설정 시 `if API_KEY: app.add_middleware(...)` 조건으로 미들웨어 자체 비활성화. 환경변수 미설정 상태에서 여전히 무인증. |
+| **H5** ws_logs 메모리 전체 로드 | **부분 개선** | 초기 전송 줄 수를 50 → 100으로 늘렸으나, `log_path.read_text()` 로 전체 파일 읽기 방식은 동일. 근본 문제 미해결. |
+| **M1** KanbanUpdate 검증 | **해결** | `@field_validator` 추가, cards title 200자 제한 적용됨. |
+| **M2** AgentEventCreate 길이 제한 | **해결** | `agent: Field(max_length=50)`, `event: Field(max_length=50)`, `message: Field(max_length=1000)` 적용. |
+| **M5** 프론트엔드 에러 무시 | **부분 해결** | `AgentStatus.jsx` fetchAgents에 `.catch((e) => console.error("fetchAgents error:", e))` 추가됨. 그러나 사용자에게 노출되는 UI 에러 표시는 여전히 없음. |
+| **M8** WS 이중연결 | **미해결** | `AgentStatus.jsx`와 `RealtimePanel.jsx`가 각각 `/ws/logs`에 독립 연결. 동일 클라이언트에서 2개 WS 연결 유지 중. |
+| **M9** 로그 스캔 캐시 없음 | **미해결** | `_detect_spawn_in_logs()` 여전히 매 `/api/agents` 호출마다 전체 로그 파일 스캔. |
+| **M10** spawn_event broadcast 미사용 | **미해결** | `ws_logs`에서 spawn_event를 `await websocket.send_json(spawn_event)` 로 해당 WS에만 전송. broadcast 미사용. |
+| **L1** globmod 미사용 import | **미해결** | `import glob as globmod` line 8에 여전히 존재. |
+| **L6** AgentStatus WS 고정 3초 재연결 | **미해결** | `setTimeout(connect, 3000)` 고정. |
+| **L7** ws_logs 예외 로깅 없음 | **미해결** | `except Exception: manager.disconnect(websocket)` — 에러 원인 기록 없음. |
+
+---
+
+## sessions_spawn 세션 감지 로직 검증
+
+`_find_agent_in_session_keys()` 함수 분석:
+
+```python
+# sessions_spawn 키 패턴: "agent:main:subagent:UUID"
+elif "subagent" in key or "isolated" in key:
+    label = session.get("label", "")
+    if label and label in AGENT_IDS and label != "main":
+        aid = label
+```
+
+**판정: 조건부 동작**
+
+- ✅ `agent:main:subagent:UUID` 형태의 키는 `"subagent" in key` 조건으로 감지됨
+- ✅ `label` 필드에서 에이전트명 추출 로직 올바름
+- ⚠️ `"isolated" in key` 패턴은 현재 OpenClaw sessions_spawn에서 생성되지 않을 가능성 있음 — 불필요한 조건이거나 향후 확장용
+- ⚠️ sessions.json의 `label` 필드가 실제로 "builder", "reviewer" 등으로 채워지는지는 OpenClaw 내부 구현에 의존. AGENTS.md에서 `label="builder"` 명시적 지정 필요.
+- ❌ 감지 후 `agent_activity` 딕셔너리에 `updatedAt` 기준으로 최신 세션만 유지하므로, 여러 subagent UUID가 동일 label을 가질 때 가장 최근 것만 반영됨 (의도된 동작으로 보임)
+
+**권고:** subagent 스폰 시 `label` 필드를 반드시 AGENT_IDS 중 하나로 명시할 것 (현재 AGENTS.md 규칙에서는 label="builder" 등 명시 중 — 올바름).
+
+---
+
+## H3 인증 미들웨어 상세 분석
+
+```python
+API_KEY = os.environ.get("API_KEY", "")
+
+if API_KEY:  # ← API_KEY가 비어있으면 미들웨어 등록 안 됨
+    app.add_middleware(APIKeyMiddleware)
+```
+
+**현재 동작:**
+- `API_KEY` 환경변수 설정 시: localhost(127.0.0.1, ::1) 제외한 외부 요청 모두 인증 요구 → ✅ 올바른 설계
+- `API_KEY` 미설정 시: 미들웨어 비활성화 → 완전 무인증 운영 → ❌ 위험
+
+**권고:** `.env` 파일에 `API_KEY` 필수 설정. 운영 가이드에 명시 필요. 또는 `API_KEY` 기본값을 무작위 생성하여 필수화.
+
+---
+
+## 이번 수정에서 발견된 신규 이슈
+
+### MEDIUM
+
+#### M11. ws_logs spawn_event가 broadcast 대신 개별 전송
+- **위치:** `backend/main.py` ws_logs 핸들러
+- **설명:** `spawn_event` 감지 시 `await websocket.send_json(spawn_event)`로 해당 WS 연결에만 전송. `agent_event`는 `manager.broadcast()`를 통해 모든 클라이언트에 전달되는 것과 불일치. RealtimePanel이 spawn을 보더라도 AgentStatus 다른 탭/클라이언트는 spawn 이벤트를 받지 못함.
+- **수정:** `await manager.broadcast(spawn_event)` 사용.
+
+---
+
+## 이번 수정 잘된 점
+
+1. **APIKeyMiddleware localhost 예외** — 개발/로컬 환경에서 불편함 없이 localhost 접근 허용하면서 외부 접근은 인증 요구. 실용적 설계.
+2. **KanbanUpdate @field_validator** — 카드 title 200자 제한, 타입 검증 추가. 데이터 무결성 향상.
+3. **AgentEventCreate max_length** — 페이로드 크기 제한으로 디스크 남용 방지.
+4. **ws_logs 실시간 tail 방식** — `f.seek(last_size)`로 파일 증분만 읽는 tail 로직은 효율적. 초기 로드만 개선하면 충분.
+
+---
+
+## 전체 미해결 이슈 현황 (4차 기준)
+
+| 이슈 | 심각도 | 내용 |
+|------|--------|------|
+| H3 (부분) | HIGH | API_KEY 미설정 시 인증 완전 비활성화 — .env 설정 필수화 |
+| H5 | HIGH | ws_logs 초기 로드 시 전체 로그 파일 메모리 적재 |
+| M8 | MEDIUM | AgentStatus + RealtimePanel WS 이중 연결 |
+| M9 | MEDIUM | _detect_spawn_in_logs() 캐시 없음 |
+| M10/M11 | MEDIUM | spawn_event broadcast 미사용 |
+| M7 | MEDIUM | 토큰 추정치 부정확 (UI 미표시) |
+| L1 | LOW | globmod 미사용 import |
+| L2 | LOW | AGENT_COLORS 중복 정의 |
+| L3 | LOW | Loading 컴포넌트 중복 |
+| L4 | LOW | 카드 ID 충돌 가능성 |
+| L6 | LOW | AgentStatus WS 고정 3초 재연결 |
+| L7 | LOW | ws_logs 예외 미로깅 |
+
+---
+
+## 4차 요약
+
+- **3차 대비 해결:** M1(KanbanUpdate 검증), M2(AgentEventCreate 길이 제한) 완전 해결. H3/M5 부분 해결.
+- **여전히 시급:** H5 (ws_logs 메모리) — 운영 중 OOM 위험. H3 partial — API_KEY `.env` 설정 필수화 권고.
+- **신규 발견:** M11 (spawn broadcast 미사용) — 1건.
+- **sessions_spawn 감지:** `"subagent" in key` + `label` 필드 추출 로직 유효. 단 `label` 명시적 지정이 전제조건.
+- **전반 평가:** 코드 품질과 안정성이 1차 리뷰 대비 크게 향상됨. 잔여 HIGH 이슈는 H5 메모리 최적화 1건과 API_KEY 운영 정책 1건. 단기간 내 해결 가능한 수준.
