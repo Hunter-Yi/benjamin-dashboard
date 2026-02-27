@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import Optional, Dict, List, Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Request
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 import httpx
 
@@ -73,6 +74,24 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 app = FastAPI(title="Benjamin Command Center")
+
+API_KEY = os.environ.get("API_KEY", "")
+
+class APIKeyMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Only protect /api/* routes
+        if request.url.path.startswith("/api/"):
+            # Skip auth for localhost requests
+            client_host = request.client.host if request.client else ""
+            if client_host not in ("127.0.0.1", "::1", "localhost"):
+                if API_KEY:
+                    key = request.headers.get("X-API-Key", "")
+                    if key != API_KEY:
+                        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+        return await call_next(request)
+
+if API_KEY:
+    app.add_middleware(APIKeyMiddleware)
 
 _file_lock = asyncio.Lock()
 
@@ -147,18 +166,34 @@ def _find_agent_in_session_keys(sessions: dict) -> dict:
     """Parse session keys to find activity for each agent."""
     agent_activity: dict = {}
     for key, session in sessions.items():
-        # Keys like "agent:researcher:main", "agent:builder:main"
         parts = key.split(":")
-        if len(parts) >= 2 and parts[0] == "agent":
+        if len(parts) < 2 or parts[0] != "agent":
+            continue
+
+        aid = None
+
+        # Standard keys like "agent:researcher:main", "agent:builder:main"
+        if len(parts) >= 2 and parts[1] in AGENT_IDS:
             aid = parts[1]
-            updated = session.get("updatedAt", 0)
-            if aid not in agent_activity or updated > agent_activity[aid]["updatedAt"]:
-                agent_activity[aid] = {
-                    "updatedAt": updated,
-                    "sessionKey": key,
-                    "origin": session.get("origin", {}),
-                    "sessionId": session.get("sessionId", ""),
-                }
+        # sessions_spawn isolated keys: "agent:main:subagent:UUID"
+        # These have a "label" field that maps to the agent name
+        elif "subagent" in key or "isolated" in key:
+            label = session.get("label", "")
+            if label and label in AGENT_IDS and label != "main":
+                aid = label
+
+        if not aid:
+            continue
+
+        updated = session.get("updatedAt", 0)
+        if aid not in agent_activity or updated > agent_activity[aid]["updatedAt"]:
+            agent_activity[aid] = {
+                "updatedAt": updated,
+                "sessionKey": key,
+                "origin": session.get("origin", {}),
+                "sessionId": session.get("sessionId", ""),
+                "label": session.get("label", ""),
+            }
     return agent_activity
 
 
@@ -453,9 +488,9 @@ def _save_agent_events(events: list):
 
 # ── API: Agent Events ─────────────────────────────────────────────────
 class AgentEventCreate(BaseModel):
-    agent: str
-    event: str  # start | checkpoint | complete | error
-    message: str
+    agent: str = Field(..., max_length=50)
+    event: str = Field(..., max_length=50)  # start | checkpoint | complete | error
+    message: str = Field(..., max_length=1000)
 
 
 @app.post("/api/agent-events")
@@ -502,6 +537,32 @@ class KanbanUpdate(BaseModel):
     columns: dict
     cards: dict
     columnOrder: list
+
+    @field_validator("columns")
+    @classmethod
+    def validate_columns(cls, v):
+        if not isinstance(v, dict):
+            raise ValueError("columns must be a dict")
+        return v
+
+    @field_validator("cards")
+    @classmethod
+    def validate_cards(cls, v):
+        if not isinstance(v, dict):
+            raise ValueError("cards must be a dict")
+        for card_id, card in v.items():
+            if isinstance(card, dict):
+                title = card.get("title", "")
+                if isinstance(title, str) and len(title) > 200:
+                    card["title"] = title[:200]
+        return v
+
+    @field_validator("columnOrder")
+    @classmethod
+    def validate_column_order(cls, v):
+        if not isinstance(v, list):
+            raise ValueError("columnOrder must be a list")
+        return v
 
 
 @app.put("/api/kanban")
@@ -640,10 +701,10 @@ async def ws_logs(websocket: WebSocket):
         await websocket.send_json({"type": "info", "message": "No log file for today yet."})
 
     try:
-        # Send last 50 lines first
+        # Send last 100 lines first
         if log_path.exists():
             lines = log_path.read_text(errors="replace").strip().split("\n")
-            for line in lines[-50:]:
+            for line in lines[-100:]:
                 parsed = _parse_log_line(line)
                 if parsed:
                     await websocket.send_json(parsed)
@@ -660,7 +721,8 @@ async def ws_logs(websocket: WebSocket):
                 with open(current_path, "r", errors="replace") as f:
                     f.seek(last_size)
                     new_data = f.read()
-                    for line in new_data.strip().split("\n"):
+                    new_lines = new_data.strip().split("\n")[-200:]  # max 200 lines at once
+                    for line in new_lines:
                         parsed = _parse_log_line(line)
                         if parsed:
                             await websocket.send_json(parsed)

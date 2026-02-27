@@ -48,7 +48,7 @@ export default function AgentStatus() {
     fetch(`${import.meta.env.BASE_URL}api/agents`)
       .then((r) => r.json())
       .then(setAgents)
-      .catch(() => {})
+      .catch((e) => console.error("fetchAgents error:", e))
       .finally(() => setLoading(false));
   };
 
@@ -61,7 +61,7 @@ export default function AgentStatus() {
   useEffect(() => {
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const base = (import.meta.env.BASE_URL || "/").replace(/\/$/, "");
-    const wsUrl = `${proto}//${window.location.host}${base}/ws/logs`;
+    const wsUrl = `${proto}//${window.location.host}${base}/ws/logs?client=agent-status`;
     let ws, unmounted = false;
     function connect() {
       if (unmounted) return;

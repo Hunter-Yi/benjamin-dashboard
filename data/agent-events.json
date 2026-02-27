@@ -26,5 +26,40 @@
     "event": "checkpoint",
     "message": "Test event for H1/H2 verification",
     "timestamp": "2026-02-27T15:28:49.722933"
+  },
+  {
+    "id": "7082ca7a-fd18-481d-a74e-0d0945a98ff1",
+    "agent": "integrator",
+    "event": "complete",
+    "message": "3차 통합 완료 - 빌드 및 서버 재시작",
+    "timestamp": "2026-02-27T16:50:30.631952"
+  },
+  {
+    "id": "4834fe94-43e3-4ea8-a155-7327acff72e0",
+    "agent": "reviewer",
+    "event": "complete",
+    "message": "3차 코드 리뷰 완료 - REVIEW.md 업데이트",
+    "timestamp": "2026-02-27T16:50:30.674363"
+  },
+  {
+    "id": "2d5e4951-895d-4057-be1c-f6f7a7312edc",
+    "agent": "builder",
+    "event": "complete",
+    "message": "WS URL prefix + 로그파싱 + 에이전트 상태 WS 브로드캐스트 수정 완료",
+    "timestamp": "2026-02-27T16:52:25.219142"
+  },
+  {
+    "id": "c6f0aafa-8341-4296-b5cc-b91adc18813b",
+    "agent": "tester",
+    "event": "complete",
+    "message": "전체 API 검증 통과 - 7 agents, WS OK, TEST_REPORT.md 업데이트",
+    "timestamp": "2026-02-27T16:52:25.249764"
+  },
+  {
+    "id": "80132bb9-42f2-463a-b3a6-b1f801944536",
+    "agent": "builder",
+    "event": "start",
+    "message": "Dashboard 버그 수정 시작 (H1/H3/H5/M1/M2/M5/M8)",
+    "timestamp": "2026-02-27T17:04:06.031831"
   }
 ]
