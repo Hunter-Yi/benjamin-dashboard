@@ -1,0 +1,72 @@
+{
+  "columns": {
+    "todo": {
+      "id": "todo",
+      "title": "예정",
+      "cardIds": [
+        "card-1",
+        "card-2"
+      ]
+    },
+    "doing": {
+      "id": "doing",
+      "title": "진행중",
+      "cardIds": [
+        "card-3"
+      ]
+    },
+    "done": {
+      "id": "done",
+      "title": "완료",
+      "cardIds": [
+        "card-4"
+      ]
+    }
+  },
+  "cards": {
+    "card-1": {
+      "id": "card-1",
+      "title": "ETF 비교 분석 리포트",
+      "agent": "researcher",
+      "createdAt": "2026-02-27T09:00:00Z",
+      "tags": [
+        "research",
+        "etf"
+      ]
+    },
+    "card-2": {
+      "id": "card-2",
+      "title": "크론잡 실패율 모니터링",
+      "agent": "optimizer",
+      "createdAt": "2026-02-27T09:30:00Z",
+      "tags": [
+        "monitoring"
+      ]
+    },
+    "card-3": {
+      "id": "card-3",
+      "title": "텔레그램 다이제스트 개선",
+      "agent": "main",
+      "createdAt": "2026-02-26T14:00:00Z",
+      "tags": [
+        "telegram",
+        "digest"
+      ]
+    },
+    "card-4": {
+      "id": "card-4",
+      "title": "FnGuide Top30 스킬 구축",
+      "agent": "builder",
+      "createdAt": "2026-02-25T10:00:00Z",
+      "tags": [
+        "skill",
+        "fnguide"
+      ]
+    }
+  },
+  "columnOrder": [
+    "todo",
+    "doing",
+    "done"
+  ]
+}
