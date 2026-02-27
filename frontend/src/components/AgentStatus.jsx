@@ -58,6 +58,26 @@ export default function AgentStatus() {
     return () => clearInterval(interval);
   }, []);
 
+  useEffect(() => {
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const base = (import.meta.env.BASE_URL || "/").replace(/\/$/, "");
+    const wsUrl = `${proto}//${window.location.host}${base}/ws/logs`;
+    let ws, unmounted = false;
+    function connect() {
+      if (unmounted) return;
+      ws = new WebSocket(wsUrl);
+      ws.onmessage = (evt) => {
+        try {
+          const data = JSON.parse(evt.data);
+          if (data.type === "agent_event") fetchAgents();
+        } catch {}
+      };
+      ws.onclose = () => { if (!unmounted) setTimeout(connect, 3000); };
+    }
+    connect();
+    return () => { unmounted = true; if (ws) ws.close(); };
+  }, []);
+
   const openModal = (agent) => {
     setSelectedAgent(agent);
     setEventsLoading(true);

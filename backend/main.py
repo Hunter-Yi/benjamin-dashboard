@@ -54,6 +54,24 @@ AGENT_COLORS = {
 INPUT_COST_PER_M = 3.0
 OUTPUT_COST_PER_M = 15.0
 
+class ConnectionManager:
+    def __init__(self):
+        self.active: list[WebSocket] = []
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.append(ws)
+    def disconnect(self, ws: WebSocket):
+        if ws in self.active:
+            self.active.remove(ws)
+    async def broadcast(self, data: dict):
+        for ws in list(self.active):
+            try:
+                await ws.send_json(data)
+            except Exception:
+                self.disconnect(ws)
+
+manager = ConnectionManager()
+
 app = FastAPI(title="Benjamin Command Center")
 
 _file_lock = asyncio.Lock()
@@ -74,7 +92,7 @@ def _today_log_path() -> Path:
 def _parse_log_line(raw: str) -> dict | None:
     try:
         obj = json.loads(raw)
-        msg = obj.get("0", "")
+        msg = obj.get("1", "") or obj.get("0", "")
         ts = obj.get("time", "")
         level = obj.get("_meta", {}).get("logLevelName", "INFO")
         return {"time": ts, "level": level, "message": msg}
@@ -265,24 +283,29 @@ async def get_agents():
         # 4) Determine last_spawned from log detection
         last_spawned = spawn_times.get(aid, "")
 
-        # 5) Recent events from agent-events.json
+        # 5) Recent events from agent-events.json (takes priority)
         agent_events = [e for e in all_events if e.get("agent") == aid]
         recent_events = agent_events[-5:]
-        # Update last_activity from events if more recent
         if agent_events:
-            event_ts = agent_events[-1].get("timestamp", "")
+            last_evt = agent_events[-1]
+            event_ts = last_evt.get("timestamp", "")
+            event_type = last_evt.get("event", "")
             if event_ts and (not last_activity or event_ts > last_activity):
                 last_activity = event_ts
-                # Re-evaluate status based on event timestamp
-                try:
-                    evt_dt = datetime.fromisoformat(event_ts)
-                    diff_minutes = (datetime.now() - evt_dt).total_seconds() / 60
-                    if diff_minutes < 5:
-                        status = "active"
-                    elif diff_minutes < 60 and status == "offline":
-                        status = "idle"
-                except Exception:
-                    pass
+            # Re-evaluate status based on last event
+            try:
+                evt_dt = datetime.fromisoformat(event_ts)
+                diff_minutes = (datetime.now() - evt_dt).total_seconds() / 60
+                if event_type == "start" and diff_minutes < 5:
+                    status = "active"
+                elif event_type in ("complete", "error") and diff_minutes < 60:
+                    status = "idle"
+                elif diff_minutes < 5:
+                    status = "active"
+                elif diff_minutes < 60 and status == "offline":
+                    status = "idle"
+            except Exception:
+                pass
 
         result.append({
             "id": aid,
@@ -451,6 +474,7 @@ async def post_agent_event(payload: AgentEventCreate):
         if len(events) > 500:
             events = events[-500:]
         _save_agent_events(events)
+    await manager.broadcast({"type": "agent_event", "data": entry})
     return entry
 
 
@@ -609,7 +633,7 @@ def _detect_spawn_event(line: str) -> dict | None:
 
 @app.websocket("/ws/logs")
 async def ws_logs(websocket: WebSocket):
-    await websocket.accept()
+    await manager.connect(websocket)
 
     log_path = _today_log_path()
     if not log_path.exists():
@@ -647,9 +671,9 @@ async def ws_logs(websocket: WebSocket):
                             await websocket.send_json(spawn_event)
                 last_size = current_size
     except WebSocketDisconnect:
-        pass
+        manager.disconnect(websocket)
     except Exception:
-        pass
+        manager.disconnect(websocket)
 
 
 # ── Static Files / SPA ─────────────────────────────────────────────────

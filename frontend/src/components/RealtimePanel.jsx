@@ -50,7 +50,8 @@ function LogStreaming() {
     function connectWS() {
       if (unmounted) return;
       const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${proto}//${window.location.host}/ws/logs`;
+      const base = (import.meta.env.BASE_URL || "/").replace(/\/$/, "");
+      const wsUrl = `${proto}//${window.location.host}${base}/ws/logs`;
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
